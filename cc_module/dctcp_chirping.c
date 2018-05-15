@@ -854,7 +854,7 @@ static void dctcp_init(struct sock *sk)
 		ca->in_initial_slow_start = 1;	
 
 		/* Alter kernel behaviour*/
-		sk->sk_pacing_rate = 0; /*This disables pacing until I explicitly set it*/
+		sk->sk_pacing_rate = ~0U; /*This disables pacing until I explicitly set it*/
 		tp->disable_kernel_pacing_calculation = 1;
 		tp->disable_cwr_upon_ece = 1;
 
