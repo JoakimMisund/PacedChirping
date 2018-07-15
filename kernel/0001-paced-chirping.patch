@@ -1,0 +1,204 @@
+From ba83b5d43aeb86581760e1cdf8e1765013632f0a Mon Sep 17 00:00:00 2001
+From: Joakim Skjelbred Misund <joakim.misund@gmail.com>
+Date: Sun, 4 Mar 2018 12:15:18 +0100
+Subject: [PATCH] Added support for chirping.
+
+1. Individual packet rates realized with two lists.
+2. Variable to disable kernel pacing rate calculation.
+3. Sysctl to disable delayed acks.
+4. Variable for disable kernels reaction to ECE
+---
+ include/linux/tcp.h        | 11 +++++++++++
+ include/net/tcp.h          |  1 +
+ net/ipv4/sysctl_net_ipv4.c |  9 +++++++++
+ net/ipv4/tcp.c             |  5 +++++
+ net/ipv4/tcp_input.c       | 19 ++++++++++++++-----
+ net/ipv4/tcp_minisocks.c   |  5 +++++
+ net/ipv4/tcp_output.c      | 11 +++++++++++
+ 7 files changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index 542ca1ae02c4..8a14461ceb33 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -141,6 +141,13 @@ static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
+ 	return (struct tcp_request_sock *)req;
+ }
+ 
++struct tcp_pacing_list {
++	struct list_head list;
++	u32 rate;
++	u32 seq;
++	ktime_t timestamp;
++};
++
+ struct tcp_sock {
+ 	/* inet_connection_sock has to be the first member of tcp_sock */
+ 	struct inet_connection_sock	inet_conn;
+@@ -294,6 +301,10 @@ struct tcp_sock {
+ 	u32	fackets_out;	/* FACK'd packets			*/
+ 
+ 	struct hrtimer	pacing_timer;
++	struct tcp_pacing_list pacing_rate_list;
++	struct tcp_pacing_list used_pacing_rate_list;
++	u32 disable_cwr_upon_ece;
++	u32 disable_kernel_pacing_calculation;
+ 
+ 	/* from STCP, retrans queue hinting */
+ 	struct sk_buff* lost_skb_hint;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 150c2c66897a..a5239eef1616 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -277,6 +277,7 @@ extern int sysctl_tcp_autocorking;
+ extern int sysctl_tcp_invalid_ratelimit;
+ extern int sysctl_tcp_pacing_ss_ratio;
+ extern int sysctl_tcp_pacing_ca_ratio;
++extern int sysctl_tcp_delayed_acks;
+ 
+ extern atomic_long_t tcp_memory_allocated;
+ extern struct percpu_counter tcp_sockets_allocated;
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 9bf809726066..b1a0dea01ed4 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -680,6 +680,15 @@ static struct ctl_table ipv4_table[] = {
+ 		.extra2		= &thousand,
+ 	},
+ 	{
++		.procname	= "tcp_delayed_acks",
++		.data		= &sysctl_tcp_delayed_acks,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one,
++	},
++	{
+ 		.procname	= "tcp_pacing_ca_ratio",
+ 		.data		= &sysctl_tcp_pacing_ca_ratio,
+ 		.maxlen		= sizeof(int),
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index a3e91b552edc..fe3c829a9452 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -400,9 +400,14 @@ void tcp_init_sock(struct sock *sk)
+ 
+ 	tp->out_of_order_queue = RB_ROOT;
+ 	tcp_init_xmit_timers(sk);
++
+ 	tcp_prequeue_init(tp);
+ 	INIT_LIST_HEAD(&tp->tsq_node);
+ 
++	/*Initialize pacing lists*/
++	INIT_LIST_HEAD(&tp->pacing_rate_list.list);
++	INIT_LIST_HEAD(&tp->used_pacing_rate_list.list);
++
+ 	icsk->icsk_rto = TCP_TIMEOUT_INIT;
+ 	tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
+ 	minmax_reset(&tp->rtt_min, tcp_jiffies32, ~0U);
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index ffe96de8a079..866e0f48bcee 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3313,7 +3313,8 @@ static void tcp_cong_control(struct sock *sk, u32 ack, u32 acked_sacked,
+ 		/* Advance cwnd if state allows */
+ 		tcp_cong_avoid(sk, ack, acked_sacked);
+ 	}
+-	tcp_update_pacing_rate(sk);
++	if (!tcp_sk(sk)->disable_kernel_pacing_calculation)
++	    tcp_update_pacing_rate(sk);
+ }
+ 
+ /* Check that window update is acceptable.
+@@ -3624,7 +3625,8 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+ 							&sack_state);
+ 
+ 		if (tcp_ecn_rcv_ecn_echo(tp, tcp_hdr(skb))) {
+-			flag |= FLAG_ECE;
++			if (likely(!tp->disable_cwr_upon_ece))
++				flag |= FLAG_ECE;
+ 			ack_ev_flags |= CA_ACK_ECE;
+ 		}
+ 
+@@ -5053,6 +5055,8 @@ static inline void tcp_data_snd_check(struct sock *sk)
+ 	tcp_check_space(sk);
+ }
+ 
++
++int sysctl_tcp_delayed_acks __read_mostly = 1;
+ /*
+  * Check if sending an ack is needed.
+  */
+@@ -5073,8 +5077,13 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+ 		/* Then ack it now */
+ 		tcp_send_ack(sk);
+ 	} else {
+-		/* Else, send delayed ack. */
+-		tcp_send_delayed_ack(sk);
++		if (sysctl_tcp_delayed_acks) {
++			/* Else, send delayed ack. */
++			tcp_send_delayed_ack(sk);
++		} else {
++			/* Delayed acks disabled */
++			tcp_send_ack(sk);
++		}
+ 	}
+ }
+ 
+@@ -6017,7 +6026,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
+ 		} else
+ 			tcp_init_metrics(sk);
+ 
+-		if (!inet_csk(sk)->icsk_ca_ops->cong_control)
++		if (!inet_csk(sk)->icsk_ca_ops->cong_control && !tp->disable_kernel_pacing_calculation)
+ 			tcp_update_pacing_rate(sk);
+ 
+ 		/* Prevent spurious tcp_cwnd_restart() on first data packet */
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 0ff83c1637d8..2a67a6f43de0 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -448,6 +448,11 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
+ 		tcp_prequeue_init(newtp);
+ 		INIT_LIST_HEAD(&newtp->tsq_node);
+ 
++
++		/*Initialize pacing lists*/
++		INIT_LIST_HEAD(&newtp->pacing_rate_list.list);
++		INIT_LIST_HEAD(&newtp->used_pacing_rate_list.list);
++
+ 		tcp_init_wl(newtp, treq->rcv_isn);
+ 
+ 		newtp->srtt_us = 0;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index e359840f46c0..39b535879f0a 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -952,12 +952,23 @@ static bool tcp_needs_internal_pacing(const struct sock *sk)
+ 
+ static void tcp_internal_pacing(struct sock *sk, const struct sk_buff *skb)
+ {
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct tcp_pacing_list *pacing_rate;
+ 	u64 len_ns;
+ 	u32 rate;
+ 
+ 	if (!tcp_needs_internal_pacing(sk))
+ 		return;
++
+ 	rate = sk->sk_pacing_rate;
++	if (likely(!list_empty(&tp->pacing_rate_list.list))){
++		pacing_rate = list_first_entry(&tp->pacing_rate_list.list, struct tcp_pacing_list, list);
++		pacing_rate->seq = tp->snd_nxt;
++		pacing_rate->timestamp = ktime_get_real();
++		list_move(&pacing_rate->list, &tp->used_pacing_rate_list.list);
++		rate = pacing_rate->rate;
++	}
++
+ 	if (!rate || rate == ~0U)
+ 		return;
+ 
+-- 
+2.11.0
+
