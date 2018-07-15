@@ -15,6 +15,9 @@ We have followed the answer to this StackOverflow question: https://stackoverflo
 The code for the modified RED-Qdisc.
 
 ## kernel
-Contain kernel patch for paced chirping and instructions on how to
-compile and install it. This takes some time and I do not guarantee that
-it works for you, but it should.
+Contain kernel patch(es) for paced chirping and instructions on how to
+compile and install it.
+
+- Versions
+-- v1: Used in the thesis
+-- v2: Changed the code from operating in rate to operate in time gaps. Reduces the number of division done in the cc module and in the kernel.
