@@ -18,6 +18,6 @@ The code for the modified RED-Qdisc.
 Contain kernel patch(es) for paced chirping and instructions on how to
 compile and install it.
 
-### Versions
+# Versions
 - v1: Used in the thesis
-- v2: Changed the code from operating in rate to operate in time gaps. Reduces the number of division done in the cc module and in the kernel.
+- v2: Changed the code from operating in rate to operate in time gaps. Reduces the number of division done in the cc module and in the kernel. The algorithm is the same as in v2.
