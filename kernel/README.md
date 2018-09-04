@@ -1,3 +1,7 @@
+# Versions
+- 0001-paced-chirping.patch should be used with the v1 cc module
+- 0001-paced-chirping-v2.patch should be used with the v2 cc module
+
 # To rebuild the kernel do the following: (from http://kernel.ubuntu.com/~kernel-ppa/mainline/v4.13.16/)
 
 git clone git://git.launchpad.net/~ubuntu-kernel-test/ubuntu/+source/linux/+git/mainline-crack v4.13.16
