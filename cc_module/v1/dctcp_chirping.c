@@ -173,7 +173,7 @@ static void print_chirp(struct tcp_sock *tp, struct chirp *chirp)
 
 static void print_u32_array(u32 *array, u32 size, char *name, struct tcp_sock *tp)
 {
-	#if TRACE_PRINTK
+	//#if TRACE_PRINTK
 	char buf[1000];
 	char *ptr = buf;
 	int i;
@@ -188,7 +188,7 @@ static void print_u32_array(u32 *array, u32 size, char *name, struct tcp_sock *t
 	}
 
 	trace_printk(buf);
-	#endif
+	//#endif
 }
 
 static inline ktime_t start_timer(void)
@@ -228,6 +228,9 @@ static void update_gap_estimate(struct tcp_sock *tp, struct dctcp *ca, u32 new_e
 		ca->gap_avg_us = new_estimate;
 		return;
 	}
+
+	trace_printk("port=%hu,VALID_CHIRP=1,est=%u\n",
+		     tp->inet_conn.icsk_bind_hash->port, new_estimate);
 
 	//shift = min(3U, max(1U, 4U - (ca->gain-100U)/25));
 	
@@ -385,11 +388,14 @@ static u32 analyze_chirp(struct sock *sk, struct chirp *chirp)
 
 	memset(E, 0, sizeof(E));
 
+	print_u32_array(chirp->recorded_inter_send_time_us, MAX_N,"recorded_inter_send",tp);
+	print_u32_array(chirp->q_delay, MAX_N,"q_delay",tp);
+
 	for (i = 1; i < N; ++i) {
 #if DISCARD_INVALID_CHIRPS
 		if (s[i] > (s[s_i] + (s[s_i]>>2))) { /*if current gap is greater than previous gap * 1.25*/
-			trace_printk("port=%hu,INVALID_CHIRP=1,si=%u,ssi=%u\n",
-				     tp->inet_conn.icsk_bind_hash->port,s[i], s[s_i]);
+			trace_printk("port=%hu,INVALID_CHIRP=1,si=%u,ssi=%u,i=%u\n",
+				     tp->inet_conn.icsk_bind_hash->port,s[i], s[s_i], i);
 			return INVALID_CHIRP;
 		}
 		if (s[i] > s[s_i]) { /*Strictly greater to deal with i = 1*/
@@ -854,7 +860,7 @@ static void dctcp_init(struct sock *sk)
 		ca->in_initial_slow_start = 1;	
 
 		/* Alter kernel behaviour*/
-		sk->sk_pacing_rate = 0; /*This disables pacing until I explicitly set it*/
+		sk->sk_pacing_rate = ~0; /*This disables pacing until I explicitly set it*/
 		tp->disable_kernel_pacing_calculation = 1;
 		tp->disable_cwr_upon_ece = 1;
 

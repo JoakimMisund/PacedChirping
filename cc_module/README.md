@@ -7,3 +7,4 @@ load:            make load
 unload:          make unload
 Set default:     sysctl -w net.ipv4.tcp_congestion_control=chirping
 
+v3 does not fully implement Paced Chirping yet.

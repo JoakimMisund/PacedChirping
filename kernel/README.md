@@ -11,6 +11,11 @@ git apply 0001-base-packaging.patch 0002-UBUNTU-SAUCE-add-vmlinux.strip-to-BOOT_
 
 
 git apply ../0001-Paced-Chirping.patch
+or
+git apply ../paced-chirping-v3.patch
 
 Then compile and install using your preferred way. You also have to create a .config file, I suggest using your current one located in /boot.
 To compile and install I have created and installed the kernel as a deb following the instructions here: https://wiki.ubuntu.com/KernelTeam/GitKernelBuild
+
+
+v3 is a more reliable version compared with the first. The CC module for v3 does not fully implement Paced Chirping yet.
