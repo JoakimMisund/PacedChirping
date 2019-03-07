@@ -1,0 +1,239 @@
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index a9b0280687d5..d66c41e6dd31 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -144,6 +144,17 @@ static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
+ 	return (struct tcp_request_sock *)req;
+ }
+ 
++struct chirp {
++	u16 packets;
++	u16 packets_out;
++	u32 gap_ns;
++	u32 gap_step_ns;
++	u32 guard_interval_ns;
++	u32 begin_seq;
++	u32 end_seq;
++	ktime_t *send_time_ktime;
++};
++
+ struct tcp_sock {
+ 	/* inet_connection_sock has to be the first member of tcp_sock */
+ 	struct inet_connection_sock	inet_conn;
+@@ -310,6 +321,13 @@ struct tcp_sock {
+ 	struct hrtimer	pacing_timer;
+ 	struct hrtimer	compressed_ack_timer;
+ 
++	
++	u32 is_chirping;
++	struct chirp chirp;
++	u32 disable_cwr_upon_ece;
++	u32 disable_kernel_pacing_calculation;
++	
++
+ 	/* from STCP, retrans queue hinting */
+ 	struct sk_buff* lost_skb_hint;
+ 	struct sk_buff *retransmit_skb_hint;
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index 104a6669e344..4a642955cadc 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -162,6 +162,7 @@ struct netns_ipv4 {
+ 	int sysctl_tcp_invalid_ratelimit;
+ 	int sysctl_tcp_pacing_ss_ratio;
+ 	int sysctl_tcp_pacing_ca_ratio;
++	int sysctl_tcp_delayed_acks;
+ 	int sysctl_tcp_wmem[3];
+ 	int sysctl_tcp_rmem[3];
+ 	int sysctl_tcp_comp_sack_nr;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 68ee02523b87..6049afcf5574 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1046,6 +1046,11 @@ struct tcp_congestion_ops {
+ 	 * after all the ca_state processing. (optional)
+ 	 */
+ 	void (*cong_control)(struct sock *sk, const struct rate_sample *rs);
++	/* call when congestion control indicates that it is sending chirps
++	 * and stack does not have a chirp description available.
++	 */
++	u32 (*new_chirp)(struct sock *sk);
++	
+ 	/* get info for inet_diag (optional) */
+ 	size_t (*get_info)(struct sock *sk, u32 ext, int *attr,
+ 			   union tcp_cc_info *info);
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index ba0fc4b18465..aba8f20d88be 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -1178,6 +1178,15 @@ static struct ctl_table ipv4_net_table[] = {
+ 		.extra1		= &zero,
+ 		.extra2		= &thousand,
+ 	},
++	{
++		.procname       = "tcp_delayed_acks",
++		.data           = &init_net.ipv4.sysctl_tcp_delayed_acks,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec_minmax,
++		.extra1         = &zero,
++		.extra2         = &one,
++	},
+ 	{
+ 		.procname	= "tcp_pacing_ca_ratio",
+ 		.data		= &init_net.ipv4.sysctl_tcp_pacing_ca_ratio,
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index ad07dd71063d..c25e5353971b 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -415,6 +415,12 @@ void tcp_init_sock(struct sock *sk)
+ 	INIT_LIST_HEAD(&tp->tsq_node);
+ 	INIT_LIST_HEAD(&tp->tsorted_sent_queue);
+ 
++	tp->chirp.packets = tp->chirp.packets_out = 0;
++	tp->is_chirping = 0;
++	tp->disable_cwr_upon_ece = 0;
++	tp->disable_kernel_pacing_calculation = 0;
++	tp->chirp.send_time_ktime = 0;
++
+ 	icsk->icsk_rto = TCP_TIMEOUT_INIT;
+ 	tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
+ 	minmax_reset(&tp->rtt_min, tcp_jiffies32, ~0U);
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 4eb0c8ca3c60..e3c0f4742ad1 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3306,7 +3306,8 @@ static void tcp_cong_control(struct sock *sk, u32 ack, u32 acked_sacked,
+ 		/* Advance cwnd if state allows */
+ 		tcp_cong_avoid(sk, ack, acked_sacked);
+ 	}
+-	tcp_update_pacing_rate(sk);
++	if (!tcp_sk(sk)->disable_kernel_pacing_calculation)
++		tcp_update_pacing_rate(sk);
+ }
+ 
+ /* Check that window update is acceptable.
+@@ -3641,7 +3642,8 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+ 							&sack_state);
+ 
+ 		if (tcp_ecn_rcv_ecn_echo(tp, tcp_hdr(skb))) {
+-			flag |= FLAG_ECE;
++			if (likely(!tp->disable_cwr_upon_ece))
++				flag |= FLAG_ECE;
+ 			ack_ev_flags |= CA_ACK_ECE;
+ 		}
+ 
+@@ -5173,8 +5175,12 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+ 	}
+ 
+ 	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
+-		tcp_send_delayed_ack(sk);
+-		return;
++		if (sock_net(sk)->ipv4.sysctl_tcp_delayed_acks) {
++			tcp_send_delayed_ack(sk);
++			return;
++		} 
++		/* Delayed acks disabled */
++		goto send_now;
+ 	}
+ 
+ 	if (!tcp_is_sack(tp) ||
+@@ -6106,7 +6112,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
+ 		if (tp->rx_opt.tstamp_ok)
+ 			tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
+ 
+-		if (!inet_csk(sk)->icsk_ca_ops->cong_control)
++		if (!inet_csk(sk)->icsk_ca_ops->cong_control && !tp->disable_kernel_pacing_calculation)
+ 			tcp_update_pacing_rate(sk);
+ 
+ 		/* Prevent spurious tcp_cwnd_restart() on first data packet */
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 79900f783e0d..55e97ef60c78 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -482,6 +482,12 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
+ 	INIT_LIST_HEAD(&newtp->tsq_node);
+ 	INIT_LIST_HEAD(&newtp->tsorted_sent_queue);
+ 
++	newtp->chirp.packets = newtp->chirp.packets_out = 0;
++	newtp->is_chirping = 0;
++	newtp->disable_cwr_upon_ece = 0;
++	newtp->disable_kernel_pacing_calculation = 0;
++	newtp->chirp.send_time_ktime = 0;
++
+ 	tcp_init_wl(newtp, treq->rcv_isn);
+ 
+ 	minmax_reset(&newtp->rtt_min, tcp_jiffies32, ~0U);
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 4522579aaca2..fe37468657a8 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -985,15 +985,43 @@ static void tcp_update_skb_after_send(struct sock *sk, struct sk_buff *skb,
+ 
+ 	if (sk->sk_pacing_status != SK_PACING_NONE) {
+ 		unsigned long rate = sk->sk_pacing_rate;
+-
++		
++		if (tp->is_chirping) {
++			if (tp->chirp.packets > tp->chirp.packets_out) {
++			
++				struct chirp *chirp = &tp->chirp;
++				u64 len_ns = chirp->gap_ns;
++				u64 credit = tp->tcp_wstamp_ns - prior_wstamp;
++
++				chirp->gap_ns = (chirp->gap_step_ns > chirp->gap_ns) ?
++					0 : chirp->gap_ns - chirp->gap_step_ns;
++				chirp->packets_out++;
++				
++				if (chirp->packets_out == chirp->packets) {
++					tp->tcp_wstamp_ns += chirp->guard_interval_ns; /*Don't care about credits here*/
++					chirp->end_seq = tp->snd_nxt + skb->len;
++					inet_csk(sk)->icsk_ca_ops->new_chirp(sk);
++				} else {
++					/* take into account OS jitter */
++					len_ns -= min_t(u64, len_ns / 2, credit);
++					tp->tcp_wstamp_ns += len_ns;
++					if (chirp->send_time_ktime) {
++						chirp->send_time_ktime[chirp->packets_out] = credit + len_ns;
++					}
++				}
++				if (chirp->packets_out == 1U) {
++					chirp->begin_seq = tp->snd_nxt;
++				}
++			}
++		}
+ 		/* Original sch_fq does not pace first 10 MSS
+ 		 * Note that tp->data_segs_out overflows after 2^32 packets,
+ 		 * this is a minor annoyance.
+ 		 */
+-		if (rate != ~0UL && rate && tp->data_segs_out >= 10) {
++		else if (rate != ~0UL && rate && tp->data_segs_out >= 10) {
+ 			u64 len_ns = div64_ul((u64)skb->len * NSEC_PER_SEC, rate);
+ 			u64 credit = tp->tcp_wstamp_ns - prior_wstamp;
+-
++				
+ 			/* take into account OS jitter */
+ 			len_ns -= min_t(u64, len_ns / 2, credit);
+ 			tp->tcp_wstamp_ns += len_ns;
+@@ -2353,6 +2381,12 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+ 		if (tcp_pacing_check(sk))
+ 			break;
+ 
++		if (tp->is_chirping &&
++		    tp->chirp.packets <= tp->chirp.packets_out &&
++		    inet_csk(sk)->icsk_ca_ops->new_chirp(sk)) {
++			break;
++		}
++
+ 		tso_segs = tcp_init_tso_segs(skb, mss_now);
+ 		BUG_ON(!tso_segs);
+ 
+@@ -2383,7 +2417,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+ 		}
+ 
+ 		limit = mss_now;
+-		if (tso_segs > 1 && !tcp_urg_mode(tp))
++		if (!tp->is_chirping && tso_segs > 1 && !tcp_urg_mode(tp))
+ 			limit = tcp_mss_split_point(sk, skb, mss_now,
+ 						    min_t(unsigned int,
+ 							  cwnd_quota,
