@@ -20,4 +20,4 @@ Directory evaluation contains code used for evaluation.
 Paced chirping is described in the following places.
 
 ## Documents
-- [Joakims master thesis](www.duo.uio.no/handle/10852/63604)
+- [Joakims master thesis](https://www.duo.uio.no/handle/10852/63604)
