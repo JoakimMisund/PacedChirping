@@ -1,25 +1,17 @@
-THIS ROADMAP WILL BE UPDATED SOON!
-
-# PacedChirping
-Code developed during work on master thesis++.
-
 # Roadmap
-Each subsection describes a directory.
 
-## cc_module
-Contains the TCP CC module code.
+This repository contains code related to the development and evaluation of Paced
+Chirping. We have divided it into three directories, master\_thesis,
+latest, and evaluation.
 
-## iproute2-4.13.0
-The whole iproute2 toolset with changes required to load the modified RED-Qdisc.
-We have followed the answer to this StackOverflow question: https://stackoverflow.com/questions/26499631/how-to-add-a-new-qdisc-in-linux
 
-## modified_red
-The code for the modified RED-Qdisc.
+Directory master\_thesis contains code used for Joakims master thesis and the
+paper "Paced Chirping: Rapid flow start with very low queuing delay" [Coming]().
 
-## kernel
-Contain kernel patch(es) for paced chirping and instructions on how to
-compile and install it.
 
-# Versions
-- v1: Used in the thesis
-- v2: Changed the code from operating in rate to operate in time gaps. Reduces the number of division done in the cc module and in the kernel. The algorithm is the same as in v2.
+Directory latest contains information about the most up to date implementation
+based on the net-next branch. This is probably where you want to go.
+
+
+Directory evaluation contains code used for evaluation.
+
