@@ -1,8 +1,7 @@
-diff --git a/include/linux/tcp.h b/include/linux/tcp.h
-index a9b0280687d5..d66c41e6dd31 100644
---- a/include/linux/tcp.h
-+++ b/include/linux/tcp.h
-@@ -144,6 +144,17 @@ static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
+
+--- ./net-next/include/linux/tcp.h.original	2019-03-15 13:47:23.748866490 +0100
++++ ./net-next/include/linux/tcp.h	2019-03-15 13:47:23.648866430 +0100
+@@ -144,6 +144,17 @@
  	return (struct tcp_request_sock *)req;
  }
  
@@ -14,13 +13,13 @@ index a9b0280687d5..d66c41e6dd31 100644
 +	u32 guard_interval_ns;
 +	u32 begin_seq;
 +	u32 end_seq;
-+	ktime_t *send_time_ktime;
++	u64 *scheduled_gaps;
 +};
 +
  struct tcp_sock {
  	/* inet_connection_sock has to be the first member of tcp_sock */
  	struct inet_connection_sock	inet_conn;
-@@ -310,6 +321,13 @@ struct tcp_sock {
+@@ -310,6 +321,13 @@
  	struct hrtimer	pacing_timer;
  	struct hrtimer	compressed_ack_timer;
  
@@ -34,23 +33,9 @@ index a9b0280687d5..d66c41e6dd31 100644
  	/* from STCP, retrans queue hinting */
  	struct sk_buff* lost_skb_hint;
  	struct sk_buff *retransmit_skb_hint;
-diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
-index 104a6669e344..4a642955cadc 100644
---- a/include/net/netns/ipv4.h
-+++ b/include/net/netns/ipv4.h
-@@ -162,6 +162,7 @@ struct netns_ipv4 {
- 	int sysctl_tcp_invalid_ratelimit;
- 	int sysctl_tcp_pacing_ss_ratio;
- 	int sysctl_tcp_pacing_ca_ratio;
-+	int sysctl_tcp_delayed_acks;
- 	int sysctl_tcp_wmem[3];
- 	int sysctl_tcp_rmem[3];
- 	int sysctl_tcp_comp_sack_nr;
-diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 68ee02523b87..6049afcf5574 100644
---- a/include/net/tcp.h
-+++ b/include/net/tcp.h
-@@ -1046,6 +1046,11 @@ struct tcp_congestion_ops {
+--- ./net-next/include/net/tcp.h.original	2019-03-15 13:47:24.028866658 +0100
++++ ./net-next/include/net/tcp.h	2019-03-15 13:47:23.888866574 +0100
+@@ -1046,6 +1046,11 @@
  	 * after all the ca_state processing. (optional)
  	 */
  	void (*cong_control)(struct sock *sk, const struct rate_sample *rs);
@@ -62,113 +47,9 @@ index 68ee02523b87..6049afcf5574 100644
  	/* get info for inet_diag (optional) */
  	size_t (*get_info)(struct sock *sk, u32 ext, int *attr,
  			   union tcp_cc_info *info);
-diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
-index ba0fc4b18465..aba8f20d88be 100644
---- a/net/ipv4/sysctl_net_ipv4.c
-+++ b/net/ipv4/sysctl_net_ipv4.c
-@@ -1178,6 +1178,15 @@ static struct ctl_table ipv4_net_table[] = {
- 		.extra1		= &zero,
- 		.extra2		= &thousand,
- 	},
-+	{
-+		.procname       = "tcp_delayed_acks",
-+		.data           = &init_net.ipv4.sysctl_tcp_delayed_acks,
-+		.maxlen         = sizeof(int),
-+		.mode           = 0644,
-+		.proc_handler   = proc_dointvec_minmax,
-+		.extra1         = &zero,
-+		.extra2         = &one,
-+	},
- 	{
- 		.procname	= "tcp_pacing_ca_ratio",
- 		.data		= &init_net.ipv4.sysctl_tcp_pacing_ca_ratio,
-diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
-index ad07dd71063d..c25e5353971b 100644
---- a/net/ipv4/tcp.c
-+++ b/net/ipv4/tcp.c
-@@ -415,6 +415,12 @@ void tcp_init_sock(struct sock *sk)
- 	INIT_LIST_HEAD(&tp->tsq_node);
- 	INIT_LIST_HEAD(&tp->tsorted_sent_queue);
- 
-+	tp->chirp.packets = tp->chirp.packets_out = 0;
-+	tp->is_chirping = 0;
-+	tp->disable_cwr_upon_ece = 0;
-+	tp->disable_kernel_pacing_calculation = 0;
-+	tp->chirp.send_time_ktime = 0;
-+
- 	icsk->icsk_rto = TCP_TIMEOUT_INIT;
- 	tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
- 	minmax_reset(&tp->rtt_min, tcp_jiffies32, ~0U);
-diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index 4eb0c8ca3c60..e3c0f4742ad1 100644
---- a/net/ipv4/tcp_input.c
-+++ b/net/ipv4/tcp_input.c
-@@ -3306,7 +3306,8 @@ static void tcp_cong_control(struct sock *sk, u32 ack, u32 acked_sacked,
- 		/* Advance cwnd if state allows */
- 		tcp_cong_avoid(sk, ack, acked_sacked);
- 	}
--	tcp_update_pacing_rate(sk);
-+	if (!tcp_sk(sk)->disable_kernel_pacing_calculation)
-+		tcp_update_pacing_rate(sk);
- }
- 
- /* Check that window update is acceptable.
-@@ -3641,7 +3642,8 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
- 							&sack_state);
- 
- 		if (tcp_ecn_rcv_ecn_echo(tp, tcp_hdr(skb))) {
--			flag |= FLAG_ECE;
-+			if (likely(!tp->disable_cwr_upon_ece))
-+				flag |= FLAG_ECE;
- 			ack_ev_flags |= CA_ACK_ECE;
- 		}
- 
-@@ -5173,8 +5175,12 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
- 	}
- 
- 	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
--		tcp_send_delayed_ack(sk);
--		return;
-+		if (sock_net(sk)->ipv4.sysctl_tcp_delayed_acks) {
-+			tcp_send_delayed_ack(sk);
-+			return;
-+		} 
-+		/* Delayed acks disabled */
-+		goto send_now;
- 	}
- 
- 	if (!tcp_is_sack(tp) ||
-@@ -6106,7 +6112,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
- 		if (tp->rx_opt.tstamp_ok)
- 			tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
- 
--		if (!inet_csk(sk)->icsk_ca_ops->cong_control)
-+		if (!inet_csk(sk)->icsk_ca_ops->cong_control && !tp->disable_kernel_pacing_calculation)
- 			tcp_update_pacing_rate(sk);
- 
- 		/* Prevent spurious tcp_cwnd_restart() on first data packet */
-diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
-index 79900f783e0d..55e97ef60c78 100644
---- a/net/ipv4/tcp_minisocks.c
-+++ b/net/ipv4/tcp_minisocks.c
-@@ -482,6 +482,12 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
- 	INIT_LIST_HEAD(&newtp->tsq_node);
- 	INIT_LIST_HEAD(&newtp->tsorted_sent_queue);
- 
-+	newtp->chirp.packets = newtp->chirp.packets_out = 0;
-+	newtp->is_chirping = 0;
-+	newtp->disable_cwr_upon_ece = 0;
-+	newtp->disable_kernel_pacing_calculation = 0;
-+	newtp->chirp.send_time_ktime = 0;
-+
- 	tcp_init_wl(newtp, treq->rcv_isn);
- 
- 	minmax_reset(&newtp->rtt_min, tcp_jiffies32, ~0U);
-diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index 4522579aaca2..fe37468657a8 100644
---- a/net/ipv4/tcp_output.c
-+++ b/net/ipv4/tcp_output.c
-@@ -985,15 +985,43 @@ static void tcp_update_skb_after_send(struct sock *sk, struct sk_buff *skb,
+--- ./net-next/net/ipv4/tcp_output.c.original	2019-03-15 13:47:24.288866819 +0100
++++ ./net-next/net/ipv4/tcp_output.c	2019-03-15 13:47:24.148866732 +0100
+@@ -985,15 +985,45 @@
  
  	if (sk->sk_pacing_status != SK_PACING_NONE) {
  		unsigned long rate = sk->sk_pacing_rate;
@@ -184,6 +65,11 @@ index 4522579aaca2..fe37468657a8 100644
 +				chirp->gap_ns = (chirp->gap_step_ns > chirp->gap_ns) ?
 +					0 : chirp->gap_ns - chirp->gap_step_ns;
 +				chirp->packets_out++;
++
++				if (chirp->packets_out == 1U) {
++					chirp->begin_seq = tp->snd_nxt;
++					credit = 0;
++				}
 +				
 +				if (chirp->packets_out == chirp->packets) {
 +					tp->tcp_wstamp_ns += chirp->guard_interval_ns; /*Don't care about credits here*/
@@ -193,12 +79,9 @@ index 4522579aaca2..fe37468657a8 100644
 +					/* take into account OS jitter */
 +					len_ns -= min_t(u64, len_ns / 2, credit);
 +					tp->tcp_wstamp_ns += len_ns;
-+					if (chirp->send_time_ktime) {
-+						chirp->send_time_ktime[chirp->packets_out] = credit + len_ns;
++					if (chirp->scheduled_gaps) {
++						chirp->scheduled_gaps[chirp->packets_out] = credit + len_ns;
 +					}
-+				}
-+				if (chirp->packets_out == 1U) {
-+					chirp->begin_seq = tp->snd_nxt;
 +				}
 +			}
 +		}
@@ -215,7 +98,7 @@ index 4522579aaca2..fe37468657a8 100644
  			/* take into account OS jitter */
  			len_ns -= min_t(u64, len_ns / 2, credit);
  			tp->tcp_wstamp_ns += len_ns;
-@@ -2353,6 +2381,12 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+@@ -2353,6 +2383,12 @@
  		if (tcp_pacing_check(sk))
  			break;
  
@@ -228,7 +111,7 @@ index 4522579aaca2..fe37468657a8 100644
  		tso_segs = tcp_init_tso_segs(skb, mss_now);
  		BUG_ON(!tso_segs);
  
-@@ -2383,7 +2417,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+@@ -2383,7 +2419,7 @@
  		}
  
  		limit = mss_now;
@@ -237,3 +120,107 @@ index 4522579aaca2..fe37468657a8 100644
  			limit = tcp_mss_split_point(sk, skb, mss_now,
  						    min_t(unsigned int,
  							  cwnd_quota,
+--- ./net-next/net/ipv4/tcp_minisocks.c.original	2019-03-15 13:47:24.560866987 +0100
++++ ./net-next/net/ipv4/tcp_minisocks.c	2019-03-15 13:47:24.420866901 +0100
+@@ -482,6 +482,12 @@
+ 	INIT_LIST_HEAD(&newtp->tsq_node);
+ 	INIT_LIST_HEAD(&newtp->tsorted_sent_queue);
+ 
++	newtp->chirp.packets = newtp->chirp.packets_out = 0;
++	newtp->is_chirping = 0;
++	newtp->disable_cwr_upon_ece = 0;
++	newtp->disable_kernel_pacing_calculation = 0;
++	newtp->chirp.scheduled_gaps = NULL;
++
+ 	tcp_init_wl(newtp, treq->rcv_isn);
+ 
+ 	minmax_reset(&newtp->rtt_min, tcp_jiffies32, ~0U);
+--- ./net-next/net/ipv4/tcp.c.original	2019-03-15 13:47:24.944867225 +0100
++++ ./net-next/net/ipv4/tcp.c	2019-03-15 13:47:24.744867101 +0100
+@@ -415,6 +415,12 @@
+ 	INIT_LIST_HEAD(&tp->tsq_node);
+ 	INIT_LIST_HEAD(&tp->tsorted_sent_queue);
+ 
++	tp->chirp.packets = tp->chirp.packets_out = 0;
++	tp->is_chirping = 0;
++	tp->disable_cwr_upon_ece = 0;
++	tp->disable_kernel_pacing_calculation = 0;
++	tp->chirp.scheduled_gaps = NULL;
++
+ 	icsk->icsk_rto = TCP_TIMEOUT_INIT;
+ 	tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
+ 	minmax_reset(&tp->rtt_min, tcp_jiffies32, ~0U);
+--- ./net-next/net/ipv4/sysctl_net_ipv4.c.original	2019-03-15 13:47:25.160867361 +0100
++++ ./net-next/net/ipv4/sysctl_net_ipv4.c	2019-03-15 13:47:25.080867311 +0100
+@@ -1179,6 +1179,15 @@
+ 		.extra2		= &thousand,
+ 	},
+ 	{
++		.procname       = "tcp_delayed_acks",
++		.data           = &init_net.ipv4.sysctl_tcp_delayed_acks,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec_minmax,
++		.extra1         = &zero,
++		.extra2         = &one,
++	},
++	{
+ 		.procname	= "tcp_pacing_ca_ratio",
+ 		.data		= &init_net.ipv4.sysctl_tcp_pacing_ca_ratio,
+ 		.maxlen		= sizeof(int),
+--- ./net-next/net/ipv4/tcp_input.c.original	2019-03-15 13:47:25.524867593 +0100
++++ ./net-next/net/ipv4/tcp_input.c	2019-03-15 13:47:25.304867453 +0100
+@@ -3306,7 +3306,8 @@
+ 		/* Advance cwnd if state allows */
+ 		tcp_cong_avoid(sk, ack, acked_sacked);
+ 	}
+-	tcp_update_pacing_rate(sk);
++	if (!tcp_sk(sk)->disable_kernel_pacing_calculation)
++		tcp_update_pacing_rate(sk);
+ }
+ 
+ /* Check that window update is acceptable.
+@@ -3641,7 +3642,8 @@
+ 							&sack_state);
+ 
+ 		if (tcp_ecn_rcv_ecn_echo(tp, tcp_hdr(skb))) {
+-			flag |= FLAG_ECE;
++			if (likely(!tp->disable_cwr_upon_ece))
++				flag |= FLAG_ECE;
+ 			ack_ev_flags |= CA_ACK_ECE;
+ 		}
+ 
+@@ -5173,8 +5175,12 @@
+ 	}
+ 
+ 	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
+-		tcp_send_delayed_ack(sk);
+-		return;
++		if (sock_net(sk)->ipv4.sysctl_tcp_delayed_acks) {
++			tcp_send_delayed_ack(sk);
++			return;
++		} 
++		/* Delayed acks disabled */
++		goto send_now;
+ 	}
+ 
+ 	if (!tcp_is_sack(tp) ||
+@@ -6106,7 +6112,7 @@
+ 		if (tp->rx_opt.tstamp_ok)
+ 			tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
+ 
+-		if (!inet_csk(sk)->icsk_ca_ops->cong_control)
++		if (!inet_csk(sk)->icsk_ca_ops->cong_control && !tp->disable_kernel_pacing_calculation)
+ 			tcp_update_pacing_rate(sk);
+ 
+ 		/* Prevent spurious tcp_cwnd_restart() on first data packet */
+--- ./net-next/include/net/netns/ipv4.h.original	2019-03-15 13:47:25.700867705 +0100
++++ ./net-next/include/net/netns/ipv4.h	2019-03-15 13:47:25.636867665 +0100
+@@ -162,6 +162,7 @@
+ 	int sysctl_tcp_invalid_ratelimit;
+ 	int sysctl_tcp_pacing_ss_ratio;
+ 	int sysctl_tcp_pacing_ca_ratio;
++	int sysctl_tcp_delayed_acks;
+ 	int sysctl_tcp_wmem[3];
+ 	int sysctl_tcp_rmem[3];
+ 	int sysctl_tcp_comp_sack_nr;
