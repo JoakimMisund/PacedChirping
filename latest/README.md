@@ -8,4 +8,4 @@ paced\_chirping has the most up-to date implementation of the kernel-part of
 Paced Chirping. It provides a chirping framework that any congestion control module can use.
 
 # Latest DCTCP congestion control module
-Coming very soon.
+Located in sub-directory module.
