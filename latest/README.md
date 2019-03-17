@@ -9,3 +9,5 @@ Paced Chirping. It provides a chirping framework that any congestion control mod
 
 # Latest DCTCP congestion control module
 Located in sub-directory module.
+
+Compile with make. Load with make load. Use with sysctl -w net.ipv4.tcp_congestion_control=chirping
